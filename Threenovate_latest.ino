@@ -1,7 +1,6 @@
 #include <AltSoftSerial.h>
 #include <Wire.h>
 #include <EEPROM.h>
-#include <Adafruit_NeoPixel.h>
 
 AltSoftSerial trm; // Arduino Nano: RX = D8, TX = D9
 
@@ -28,17 +27,31 @@ AltSoftSerial trm; // Arduino Nano: RX = D8, TX = D9
 #define MOSFET_OFF_LEVEL LOW
 
 /*
- * Addressable RGB LED data input is connected to D5.
- * This configuration assumes one WS2812/NeoPixel-compatible LED
- * using GRB order and an 800 kHz data signal.
+ * WS2812 strip configuration.
+ *
+ * This driver is BUFFERLESS: it does not allocate 3 bytes per LED.
+ * Every LED receives the same GRB value as the frame is transmitted.
+ *
+ * IMPORTANT:
+ * - Designed for an Arduino Nano / ATmega328P running at 16 MHz.
+ * - LIGHT_DATA_PIN must remain D5 with this implementation.
+ * - Set LED_COUNT to the real number of LEDs in the strip.
  */
-#define LED_COUNT 100
+#define LED_COUNT 100U
 
-Adafruit_NeoPixel strip(
-  LED_COUNT,
-  LIGHT_DATA_PIN,
-  NEO_GRB + NEO_KHZ800
-);
+/*
+ * Default white intensity for each RGB channel.
+ * 64 is about 25% of the 0-255 channel range.
+ */
+#define LED_WHITE_LEVEL 64U
+
+#if F_CPU != 16000000UL
+#error "Bufferless WS2812 driver requires a 16 MHz ATmega328P."
+#endif
+
+#if LIGHT_DATA_PIN != 5
+#error "Bufferless WS2812 driver is hard-coded for Arduino Nano D5."
+#endif
 
 // ============================================================
 // IMU CONFIGURATION — MPU6050
@@ -154,21 +167,113 @@ void processQmtRecvLine(const String &line);
 void processQmtRecvFromBuffer(const String &buffer);
 
 // ============================================================
-// OUTPUT CONTROL
+// BUFFERLESS WS2812 OUTPUT CONTROL
 // ============================================================
+
+/*
+ * Send one WS2812 byte, most-significant bit first.
+ *
+ * The implementation uses direct PORTD access and fixed AVR cycle
+ * delays. It is intentionally specific to:
+ *
+ *   Arduino Nano / ATmega328P
+ *   CPU clock: 16 MHz
+ *   data pin: D5 / PD5
+ *
+ * Interrupts are disabled only while the complete LED frame is
+ * transmitted. For 100 LEDs this is approximately 3 ms.
+ */
+static inline void ws2812SendByte(uint8_t value) {
+  for (uint8_t mask = 0x80U; mask != 0U; mask >>= 1U) {
+    if (value & mask) {
+      /*
+       * Logical 1:
+       * approximately 0.7 us HIGH and 0.55 us LOW.
+       */
+      PORTD |= _BV(PD5);
+
+      __builtin_avr_delay_cycles(8);
+
+      PORTD &= (uint8_t)~_BV(PD5);
+
+      __builtin_avr_delay_cycles(5);
+    } else {
+      /*
+       * Logical 0:
+       * approximately 0.35 us HIGH and 0.9 us LOW.
+       */
+      PORTD |= _BV(PD5);
+
+      __builtin_avr_delay_cycles(3);
+
+      PORTD &= (uint8_t)~_BV(PD5);
+
+      __builtin_avr_delay_cycles(10);
+    }
+  }
+}
+
+/*
+ * Send the same color to every LED without storing an LED array.
+ *
+ * WS2812 normally expects GRB byte order.
+ */
+void setAllLedsSameColor(
+  uint8_t red,
+  uint8_t green,
+  uint8_t blue
+) {
+  uint8_t oldSreg = SREG;
+
+  noInterrupts();
+
+  for (uint16_t i = 0; i < LED_COUNT; i++) {
+    ws2812SendByte(green);
+    ws2812SendByte(red);
+    ws2812SendByte(blue);
+  }
+
+  /*
+   * Restore the previous interrupt state.
+   */
+  SREG = oldSreg;
+
+  /*
+   * WS2812 reset/latch interval.
+   */
+  delayMicroseconds(300);
+}
+
+void forceLightOffFrame() {
+  /*
+   * Always transmit an all-zero frame.
+   *
+   * Do not skip this based on a software state flag: after reset,
+   * the Arduino may not know that the strip still contains a
+   * previously latched color.
+   */
+  setAllLedsSameColor(0, 0, 0);
+}
 
 void turnLightOff() {
   /*
-   * Turn the power/control output off and send RGB 0,0,0 to the
-   * addressable LED on D5.
+   * Keep strip power enabled while sending the OFF frame.
+   * If power is removed first, the LEDs cannot receive the zeros.
    */
-  strip.setPixelColor(
-    0,
-    strip.Color(0, 0, 0)
-  );
-  strip.show();
+  digitalWrite(LIGHT_PIN, MOSFET_ON_LEVEL);
+  delay(5UL);
 
+  forceLightOffFrame();
+
+  /*
+   * Then remove strip power through the MOSFET.
+   */
   digitalWrite(LIGHT_PIN, MOSFET_OFF_LEVEL);
+
+  /*
+   * Hold the data line LOW to avoid parasitic powering through DIN.
+   */
+  digitalWrite(LIGHT_DATA_PIN, LOW);
 }
 
 void turnSirenOff() {
@@ -180,34 +285,35 @@ void turnLightOnFor(unsigned long durationMs) {
   Serial.println(F("Executing command: LIGHT ON"));
 
   /*
-   * Enable the light power/control output on D3, then send a white
-   * RGB value through the NeoPixel data connection on D5.
+   * Power the strip before transmitting the frame.
    */
   digitalWrite(LIGHT_PIN, MOSFET_ON_LEVEL);
+  delay(50UL);
 
-  strip.setPixelColor(
-    0,
-    strip.Color(255, 255, 255)
+  setAllLedsSameColor(
+    LED_WHITE_LEVEL,
+    LED_WHITE_LEVEL,
+    LED_WHITE_LEVEL
   );
-  strip.show();
 
-  Serial.print(F("Light power/control pin D"));
-  Serial.print(LIGHT_PIN);
-  Serial.println(F(" set to ON."));
+  Serial.print(F("Sent one bufferless white frame to "));
+  Serial.print(LED_COUNT);
+  Serial.println(F(" WS2812 LEDs."));
 
-  Serial.print(F("NeoPixel RGB data sent through D"));
-  Serial.print(LIGHT_DATA_PIN);
-  Serial.println(F(": 255, 255, 255 (white)."));
+  Serial.print(F("Per-channel intensity: "));
+  Serial.println(LED_WHITE_LEVEL);
+
+  Serial.print(F("Light will remain ON for "));
+  Serial.print(durationMs / 1000UL);
+  Serial.println(F(" seconds."));
 
   delay(durationMs);
 
   turnLightOff();
 
-  Serial.print(F("Light power on D"));
-  Serial.print(LIGHT_PIN);
-  Serial.print(F(" disabled; RGB 0,0,0 sent through D"));
-  Serial.print(LIGHT_DATA_PIN);
-  Serial.println(F("."));
+  Serial.println(
+    F("Zero frame sent and strip power switched OFF.")
+  );
 }
 
 void turnSirenOnFor(unsigned long durationMs) {
@@ -526,46 +632,70 @@ void flushTRM() {
 }
 
 bool waitFor(
-    const char *expected,
-    unsigned long timeoutMs
-)
-{
-    unsigned long start = millis();
+  const char *expected,
+  unsigned long timeoutMs
+) {
+  unsigned long start = millis();
 
-    while (millis() - start < timeoutMs)
-    {
-        while (trm.available())
-        {
-            char c = trm.read();
+  size_t expectedLength = strlen(expected);
+  size_t matched = 0;
 
-            rxBuf += c;
-            Serial.write(c);
+  while (millis() - start < timeoutMs) {
+    while (trm.available()) {
+      char c = trm.read();
 
-            if (rxBuf.indexOf(expected) >= 0)
-            {
-                // keep reading until modem becomes quiet
+      Serial.write(c);
 
-                unsigned long quiet = millis();
+      /*
+       * Keep a bounded copy for later +QMTRECV parsing.
+       * This prevents unbounded String growth on the Nano.
+       */
+      if (rxBuf.length() < 420U) {
+        rxBuf += c;
+      }
 
-                while (millis() - quiet < 500)
-                {
-                    while (trm.available())
-                    {
-                        char d = trm.read();
+      /*
+       * Match the expected response directly from the incoming
+       * stream, so success does not depend on rxBuf allocation.
+       */
+      if (c == expected[matched]) {
+        matched++;
 
-                        rxBuf += d;
-                        Serial.write(d);
+        if (matched == expectedLength) {
+          unsigned long quietStart = millis();
 
-                        quiet = millis();
-                    }
-                }
+          /*
+           * Continue reading until the modem has been quiet for
+           * 500 ms. This also captures an immediately delivered
+           * retained +QMTRECV message.
+           */
+          while (millis() - quietStart < 500UL) {
+            while (trm.available()) {
+              char d = trm.read();
 
-                return true;
+              Serial.write(d);
+
+              if (rxBuf.length() < 420U) {
+                rxBuf += d;
+              }
+
+              quietStart = millis();
             }
-        }
-    }
+          }
 
-    return false;
+          return true;
+        }
+      } else {
+        /*
+         * Restart matching. If this character is also the first
+         * expected character, preserve it as a one-character match.
+         */
+        matched = (c == expected[0]) ? 1U : 0U;
+      }
+    }
+  }
+
+  return false;
 }
 
 bool sendAT(
@@ -728,7 +858,7 @@ bool mqttConnect() {
   if (!sendAT(
         command,
         "+QMTCONN: 0,0,0",
-        25000UL
+        50000UL
       )) {
     Serial.println(F("MQTT client connection failed."));
 
@@ -1854,26 +1984,29 @@ void waitOffPeriod() {
 
   Serial.println(F("========================================"));
 
+  /*
+   * Apply safe outputs once before entering the wait loop.
+   *
+   * Do not repeatedly call turnLightOff() here because WS2812
+   * transmission temporarily disables interrupts and can disturb
+   * AltSoftSerial communication.
+   */
+  turnLightOff();
+  turnSirenOff();
+
+  digitalWrite(
+    TRM_POWER_PIN,
+    MOSFET_OFF_LEVEL
+  );
+
   unsigned long start = millis();
+  int lastPrinted = -1;
 
   while (millis() - start < offTimeMs) {
-
-    turnLightOff();
-    turnSirenOff();
-
-    digitalWrite(
-      TRM_POWER_PIN,
-      MOSFET_OFF_LEVEL
-    );
-
     unsigned long elapsed = millis() - start;
     unsigned long remainingMs = offTimeMs - elapsed;
 
-    // Print only during the last 10 seconds
     if (remainingMs <= 10000UL) {
-
-      static int lastPrinted = -1;
-
       int remainingSeconds =
         (remainingMs + 999UL) / 1000UL;
 
@@ -1905,17 +2038,14 @@ void setup() {
   Wire.begin();
 
   pinMode(LIGHT_PIN, OUTPUT);
+  pinMode(LIGHT_DATA_PIN, OUTPUT);
   pinMode(SIREN_PIN, OUTPUT);
   pinMode(TRM_POWER_PIN, OUTPUT);
 
   /*
-   * Initialize the addressable LED library before sending any
-   * color data. Adafruit_NeoPixel configures D5 internally.
+   * WS2812 data line must idle LOW.
    */
-  strip.begin();
-  strip.setBrightness(255);
-  strip.clear();
-  strip.show();
+  digitalWrite(LIGHT_DATA_PIN, LOW);
 
   /*
    * Begin in a safe state.
